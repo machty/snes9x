@@ -114,6 +114,7 @@ class Resampler
 
     inline void push_sample(int16_t l, int16_t r)
     {
+		// pushes a single sample into a buffer.
         if (space_empty() >= 2)
         {
             int end = start + size;

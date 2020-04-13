@@ -3,6 +3,8 @@
 #include "../../../snes9x.h"
 
 #include "SPC_DSP.h"
+#include "tinyosc.h"
+#include <errno.h>
 
 #include "blargg_endian.h"
 #include <string.h>
@@ -44,6 +46,10 @@ static BOOST::uint8_t const initial_regs [SPC_DSP::register_count] =
 	0x75,0xF5,0x06,0x97,0x10,0xC3,0x24,0xBB,0x00,0x00,0x7B,0x7A,0xE0,0x60,0x12,0x0F,
 	0xF7,0x74,0x1C,0xE5,0x39,0x3D,0x73,0xC1,0x00,0x00,0x7A,0xB3,0xFF,0x4E,0x7B,0xFF
 };
+
+// 32767  = 0b0111111111111111
+// -32786 = 0b1000000000000000
+// sounds like the highest bit is left open to handle overage before auto-wrapping happens
 
 // if ( io < -32768 ) io = -32768;
 // if ( io >  32767 ) io =  32767;
@@ -569,6 +575,9 @@ inline unsigned SPC_DSP::read_counter( int rate )
 
 inline void SPC_DSP::run_envelope( voice_t* const v )
 {
+	// S-SMP, is a dedicated single chip consisting of an 8-bit CPU,
+	// along with a 16-bit DSP, and 64 KB of SRAM.
+	// there are 9 voices here, not sure if this is related to the 8 voices?
 	int env = v->env;
 	if ( v->env_mode == env_release ) // 60%
 	{
@@ -578,6 +587,7 @@ inline void SPC_DSP::run_envelope( voice_t* const v )
 	}
 	else
 	{
+		// gets here on first sound i think?
 		int rate;
 		int env_data = VREG(v->regs,adsr1);
 		if ( m.t_adsr0 & 0x80 ) // 99% ADSR
@@ -629,6 +639,7 @@ inline void SPC_DSP::run_envelope( voice_t* const v )
 
 		// Sustain level
 		if ( (env >> 8) == (env_data >> 5) && v->env_mode == env_decay )
+			// transition from decaying from attack to sustain
 			v->env_mode = env_sustain;
 
 		v->hidden_env = env;
@@ -638,6 +649,7 @@ inline void SPC_DSP::run_envelope( voice_t* const v )
 		{
 			env = (env < 0 ? 0 : 0x7FF);
 			if ( v->env_mode == env_attack )
+				// transition from attack to decay phase
 				v->env_mode = env_decay;
 		}
 
@@ -713,6 +725,7 @@ inline void SPC_DSP::decode_brr( voice_t* v )
 
 MISC_CLOCK( 27 )
 {
+	// 0xFE = 11111110
 	m.t_pmon = REG(pmon) & 0xFE; // voice 0 doesn't support PMON
 }
 MISC_CLOCK( 28 )
@@ -723,13 +736,23 @@ MISC_CLOCK( 28 )
 }
 MISC_CLOCK( 29 )
 {
-	if ( (m.every_other_sample ^= 1) != 0 )
+	// this line does a few things:
+	// 1) toggle the every_other_sample boolean between 0/1
+	// 2) when the new value is 1, it writes the new kon
+	// when every_other sample: 0
+	if ( (m.every_other_sample ^= 1) != 0 ) {
+		// new_kon = (new_kon & bitnegate(kon))
+		// after this runs, new_kon will only have flags it had before that kon does NOT have.
+		// IOW, new_kon will remove all the current (and presumably already processed kons).
 		m.new_kon &= ~m.kon; // clears KON 63 clocks after it was last read
+	}
 }
 MISC_CLOCK( 30 )
 {
 	if ( m.every_other_sample )
 	{
+		// This is where m.kon gets initialized with new notes / voices that have been turned on... i think.
+		// basically it's prepping the next cycle
 		m.kon    = m.new_kon;
 		m.t_koff = REG(koff) | m.mute_mask;
 	}
@@ -764,7 +787,36 @@ inline VOICE_CLOCK( V2 )
 
 	m.t_adsr0 = VREG(v->regs,adsr0);
 
-	// Read pitch, spread over two clocks
+	// Read pitch, spread over two clocks (this sets the lowest value bits to the right)
+	// Pitch is a 14-bit value.
+	
+	// SNES is 32kHz sample rate
+	// Let desired DSP pitch be P.
+	// Pitch->Hz
+	// HZ = 32000 * (P / 2^12)
+	// HZ = P * 7.8125
+	
+	// so if i want 440, P should be 56.32
+	// octave up = 112
+	
+	// highest pitch value is (2<<14) - 1 == 32767
+	// HZ = 255992
+	
+	/*
+	 
+	 A few pitch->interval relations...
+
+		 400h     800h   1000h     2000h   3FFFh
+	 -----|--------|-------|---------|-------|-----
+		-2oct   -1oct   original   +1oct   +2oct
+						 sound
+					 (best quality!)
+	 
+	 */
+	
+	// so this all depends on the size of the sample.
+	// ANY WAY. we should send t_pitch through
+	
 	m.t_pitch = VREG(v->regs,pitchl);
 }
 inline VOICE_CLOCK( V3a )
@@ -781,8 +833,19 @@ inline VOICE_CLOCK( V3b )
 inline VOICE_CLOCK( V3c )
 {
 	// Pitch modulation using previous voice's output
-	if ( m.t_pmon & v->vbit )
+	if ( m.t_pmon & v->vbit ) {
+		// https://wiki.superfamicom.org/spc700-reference
+		// Pitch modulation multiplies the current pitch of the channel by OUTX of the previous channel.
+		// (P (modulated) = P[X] * (1 + OUTX[X-1])
+		//
+		// So a sine wave in the previous channel would cause some vibrato on the modulated channel.
+		// Note that OUTX is before volume multiplication, so you can have a silent channel for modulating.
+		
+		// t_output is a temporary holding spot for the PREVIOUS voice's output
+		
+		// haven't yet found a ROM that uses this
 		m.t_pitch += ((m.t_output >> 5) * m.t_pitch) >> 10;
+	}
 
 	if ( v->kon_delay )
 	{
@@ -793,7 +856,6 @@ inline VOICE_CLOCK( V3c )
 			v->brr_offset  = 1;
 			v->buf_pos     = 0;
 			m.t_brr_header = 0; // header is ignored on this sample
-			m.kon_check    = true;
 
 			if (take_spc_snapshot)
 			{
@@ -809,7 +871,8 @@ inline VOICE_CLOCK( V3c )
 
 		// Disable BRR decoding until last three samples
 		v->interp_pos = 0;
-		if ( --v->kon_delay & 3 )
+
+		if ( --v->kon_delay & 3 ) // bitwise AND with 0b011
 			v->interp_pos = 0x4000;
 
 		// Pitch is never added during KON
@@ -821,11 +884,21 @@ inline VOICE_CLOCK( V3c )
 		int output = interpolate( v );
 
 		// Noise
-		if ( m.t_non & v->vbit )
+		if ( m.t_non & v->vbit ) {
+			// noise for this voice
 			output = (int16_t) (m.noise * 2);
+		}
 
 		// Apply envelope
-		m.t_output = (output * v->env) >> 11 & ~1;
+		// output is a sample from the voice.
+		// We multiply it against the current value of the envelope.
+		// Then we shift it right 11 for some reason and AND it with ~1 (1111111110).
+		
+		// t_output is "internal state recalculated on every sample".
+		m.t_output = ((output * v->env) >> 11) & ~1;
+		
+		// write the current value of the ENV.
+		// not sure why, since we already multiplied it.
 		v->t_envx_out = (uint8_t) (v->env >> 4);
 	}
 
@@ -839,14 +912,20 @@ inline VOICE_CLOCK( V3c )
 	if ( m.every_other_sample )
 	{
 		// KOFF
-		if ( m.t_koff & v->vbit )
+		if ( m.t_koff & v->vbit ) {
+			// this voice is turning off
 			v->env_mode = env_release;
+		}
 
 		// KON
 		if ( m.kon & v->vbit )
 		{
+			// this voice is turning on
 			v->kon_delay = 5;
 			v->env_mode  = env_attack;
+			v->is_new_note = 1;
+			
+			//printf("attack: voice_number=%d buf_pos=%d vbit=%d brr_offset=%d\n", v->voice_number, v->buf_pos, v->vbit, v->brr_offset);
 		}
 	}
 
@@ -858,6 +937,7 @@ inline VOICE_CLOCK( V3c )
 inline void SPC_DSP::voice_output( voice_t const* v, int ch )
 {
 	// Apply left/right volume
+	// voll + 1 == volr (when ch==0: L, when ch==1: R)
 	int amp = (m.t_output * (int8_t) VREG(v->regs,voll + ch)) >> 7;
 	amp *= ((stereo_switch & (1 << (v->voice_number + ch * voice_count))) ? 1 : 0);
 
@@ -889,6 +969,9 @@ inline VOICE_CLOCK( V4 )
 			if ( m.t_brr_header & 1 )
 			{
 				v->brr_addr = m.t_brr_next_addr;
+				// set t_looped to vbit flag (it was set to 0 above).
+				// I don't totally get this, but this flag seems to get OR'd
+				// into the ENDX buffer.
 				m.t_looped = v->vbit;
 			}
 			v->brr_offset = 1;
@@ -896,7 +979,15 @@ inline VOICE_CLOCK( V4 )
 	}
 
 	// Apply pitch
+	// This is the only place where pitch is used to change the
+	// sample position in the waveform.
 	v->interp_pos = (v->interp_pos & 0x3FFF) + m.t_pitch;
+	
+	if (m.t_pitch && v->is_new_note) {
+		// send OSC
+		v->is_new_note = 0;
+		send_osc(v);
+	}
 
 	// Keep from getting too far ahead (when using pitch modulation)
 	if ( v->interp_pos > 0x7FFF )
@@ -914,8 +1005,12 @@ inline VOICE_CLOCK( V5 )
 	int endx_buf = REG(endx) | m.t_looped;
 
 	// Clear bit in ENDX if KON just began
-	if ( v->kon_delay == 5 )
+	if ( v->kon_delay == 5 ) {
+		// if vbit is 00100000
+		//   ~vbit is 11011111
+		// when &'d with endx_buf, this unsets the flag
 		endx_buf &= ~v->vbit;
+	}
 	m.endx_buf = (uint8_t) endx_buf;
 }
 inline VOICE_CLOCK( V6 )
@@ -1029,6 +1124,7 @@ ECHO_CLOCK( 25 )
 }
 inline int SPC_DSP::echo_output( int ch )
 {
+	// mvoll/mvolr is main volume, evoll/evolr is echo volume.
 	int out = (int16_t) ((m.t_main_out [ch] * (int8_t) REG(mvoll + ch * 0x10)) >> 7) +
 			(int16_t) ((m.t_echo_in [ch] * (int8_t) REG(evoll + ch * 0x10)) >> 7);
 	CLAMP16( out );
@@ -1194,6 +1290,29 @@ void SPC_DSP::init( void* ram_64k )
 	stereo_switch = 0xffff;
 	take_spc_snapshot = 0;
 	spc_snapshot_callback = 0;
+	
+	if ( (oscfd = socket(AF_INET, SOCK_DGRAM, 0)) < 0 ) {
+        perror("socket creation failed");
+        exit(EXIT_FAILURE);
+    }
+
+	memset(&servaddr, 0, sizeof(servaddr));
+	servaddr.sin_family = AF_INET;
+	servaddr.sin_addr.s_addr = inet_addr("0.0.0.0");
+	//servaddr.sin_addr.s_addr = INADDR_ANY;
+	servaddr.sin_port = htons(4559);
+	
+	
+	
+	/*
+	if(connect(oscfd, (struct sockaddr *)&servaddr, sizeof(servaddr)) < 0)
+    {
+        printf("\n Error : Connect Failed \n");
+        exit(0);
+    }
+	 */
+
+	printf("sockfd=%d \n", oscfd);
 
 	#ifndef NDEBUG
 		// be sure this sign-extends
@@ -1229,6 +1348,33 @@ void SPC_DSP::soft_reset_common()
 		m.voices[i].voice_number = i;
 }
 
+void SPC_DSP::send_osc(voice_t * const v)
+{
+	// declare a buffer for writing the OSC packet into
+	char buffer[1024];
+
+	// write the OSC packet to the buffer
+	// returns the number of bytes written to the buffer, negative on error
+	// note that tosc_write will clear the entire buffer before writing to it
+	int len = tosc_writeMessage(
+		buffer, sizeof(buffer),
+		"/snes/voice", // the address
+		"iiii",   // the format; 'f':32-bit float, 's':ascii string, 'i':32-bit integer
+		v->voice_number, v->buf_pos, v->brr_offset, m.t_pitch);
+
+	// 0x800 == MSG_CONFIRM
+	int a = sendto(oscfd, (const char *)buffer, len, 0,
+				   (const struct sockaddr *) &servaddr,
+			sizeof(servaddr));
+	
+	int e = errno;
+	if (e) {
+		printf("Oh dear, something went wrong with send_to()! %s\n", strerror(errno));
+	}
+	
+}
+
+
 void SPC_DSP::soft_reset()
 {
 	REG(flg) = 0xE0;
@@ -1248,6 +1394,7 @@ void SPC_DSP::load( uint8_t const regs [register_count] )
 		v->vbit       = 1 << i;
 		v->regs       = &m.regs [i * 0x10];
 	}
+	// ALEX disregard these; only seems to run at startup
 	m.new_kon = REG(kon);
 	m.t_dir   = REG(dir);
 	m.t_esa   = REG(esa);

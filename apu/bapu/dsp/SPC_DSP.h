@@ -6,6 +6,11 @@
 
 #include "blargg_common.h"
 
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <arpa/inet.h>
+#include <netinet/in.h>
+
 extern "C" { typedef void (*dsp_copy_func_t)( unsigned char** io, void* state, size_t ); }
 
 class SPC_DSP {
@@ -64,11 +69,11 @@ public:
 	typedef dsp_copy_func_t copy_func_t;
 	void copy_state( unsigned char** io, copy_func_t );
 
-	// Returns non-zero if new key-on events occurred since last call
-	bool check_kon();
 
 // Snes9x Accessor
 
+	int oscfd;
+	struct sockaddr_in     servaddr;
 	int     stereo_switch;
 	int     take_spc_snapshot;
 	void    (*spc_snapshot_callback) (void);
@@ -133,6 +138,7 @@ public:
 		int hidden_env;         // used by GAIN mode 7, very obscure quirk
 		uint8_t t_envx_out;
 		int voice_number;
+		int is_new_note;
 	};
 private:
 	enum { brr_block_size = 9 };
@@ -154,7 +160,6 @@ private:
 		int echo_offset;        // offset from ESA in echo buffer
 		int echo_length;        // number of bytes that echo_offset will stop at
 		int phase;              // next clock cycle to run (0-31)
-		bool kon_check;         // set when a new KON occurs
 
 		// Hidden registers also written to when main register is written to
 		int new_kon;
@@ -186,6 +191,7 @@ private:
 		int t_output;
 		int t_looped;
 		int t_echo_ptr;
+		int t_is_new;
 
 		// left/right sums
 		int t_main_out [2];
@@ -251,6 +257,8 @@ private:
 	void echo_30();
 
 	void soft_reset_common();
+	
+	void send_osc( voice_t* const );
 };
 
 #include <assert.h>
@@ -293,12 +301,6 @@ inline void SPC_DSP::write( int addr, int data )
 
 inline void SPC_DSP::mute_voices( int mask ) { m.mute_mask = mask; }
 
-inline bool SPC_DSP::check_kon()
-{
-	bool old = m.kon_check;
-	m.kon_check = 0;
-	return old;
-}
 
 #if !SPC_NO_COPY_STATE_FUNCS
 
